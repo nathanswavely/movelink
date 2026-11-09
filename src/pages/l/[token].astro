@@ -115,10 +115,10 @@ const list = (names: string[]) => (names.length <= 2 ? names.join(' and ') : `${
       {isOrganizer && <> <a href={u(`/m/${m.id}`)}>Manage this move</a></>}
     </p>
 
-    {done === 'signed' && <div class="lt-callout lt-tone-success">You're signed up. This browser remembers you, so you can come back here to change your answer.</div>}
-    {done === 'saved' && <div class="lt-callout lt-tone-success">Saved.</div>}
-    {done === 'cancelled' && <div class="lt-callout lt-tone-info">You're off this move.</div>}
-    {error && <div class="lt-callout lt-tone-error">{error}</div>}
+    {done === 'signed' && <div class="lt-callout lt-tone-success" data-notice="success">You're signed up. This browser remembers you, so you can come back here to change your answer.</div>}
+    {done === 'saved' && <div class="lt-callout lt-tone-success" data-notice="success">Saved.</div>}
+    {done === 'cancelled' && <div class="lt-callout lt-tone-info" data-notice="info">You're off this move.</div>}
+    {error && <div class="lt-callout lt-tone-error" data-notice="error">{error}</div>}
     {m.notes && <div class="lt-card notes"><p style="margin:0;white-space:pre-line">{m.notes}</p></div>}
 
     <h2 class="section">Where</h2>

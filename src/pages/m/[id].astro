@@ -123,6 +123,7 @@ const placeById = new Map(m.places.map((p) => [p.id, p]));
 const link = new URL(u(`/l/${m.link}`), import.meta.env.DEV ? Astro.url.origin : Astro.site).toString();
 const done = Astro.url.searchParams.get('done');
 const isNew = Astro.url.searchParams.has('new');
+const tone = done === 'last-organizer' || done === 'place-in-use' ? 'warning' : 'success';
 const upcoming = isUpcoming(m);
 const shiftsOf = (helperId: string) => m.shifts.filter((s) => (m.signups.get(s.id) ?? []).includes(helperId));
 const sms = (phones: string[]) => `sms:${phones.map((p) => p.replace(/[^\d+]/g, '')).join(',')}`;
@@ -134,8 +135,8 @@ const total = (pid: string) => [...(m.shares.get(pid)?.values() ?? [])].reduce((
   <h1 class="page">{m.title}</h1>
   <p class="page-lead">{upcoming ? 'You and anyone you add run this move.' : 'This move is over.'} MoveLink forgets it, and everyone on it, on {dateLabel(m.forgetAt, m.tz)}.</p>
 
-  {error && <div class="lt-callout lt-tone-error" style="margin-bottom:1rem">{error}</div>}
-  {done && DONE[done] && <div class={`lt-callout lt-tone-${done === 'last-organizer' || done === 'place-in-use' ? 'warning' : 'success'}`} style="margin-bottom:1rem">{DONE[done]}</div>}
+  {error && <div class="lt-callout lt-tone-error" data-notice="error" style="margin-bottom:1rem">{error}</div>}
+  {done && DONE[done] && <div class={`lt-callout lt-tone-${tone}`} data-notice={tone} style="margin-bottom:1rem">{DONE[done]}</div>}
 
   <section class="lt-card share">
     <h2 style="margin-top:0">The move link</h2>

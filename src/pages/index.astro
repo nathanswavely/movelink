@@ -61,7 +61,7 @@ const when = (m: Move) => (isUpcoming(m) ? 'Coming up' : `Forgotten ${dateLabel(
   <section>
     <h2 class="section">Start a move</h2>
     <form method="post" class="lt-card lt-form">
-      {error && <div class="lt-callout lt-tone-error">{error}</div>}
+      {error && <div class="lt-callout lt-tone-error" data-notice="error">{error}</div>}
       <label class="lt-label">
         <span>What's it called?</span>
         <input class="lt-field" name="title" maxlength="80" placeholder="Mom's move" required />

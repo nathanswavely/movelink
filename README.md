@@ -52,5 +52,5 @@ checkout other than `../swavely-lol` with `HUB_DIR`.
 
 1. The D1 database `movelink` exists (2026-11-09); its id is in `wrangler.jsonc`.
 2. The Hub deployed first, with MoveLink's tile no longer marked `soon`.
-3. `@swavely-lol/kit` at its tag, not from disk (it is, from v0.1.0).
+3. `@swavely-lol/kit` at its tag, not from disk (it is, at v0.2.0).
 4. `npm run deploy`. No secrets: mail goes through the Hub.
