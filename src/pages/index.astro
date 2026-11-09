@@ -1,0 +1,78 @@
+---
+import Base from '../layouts/Base.astro';
+import { getEnv, u } from '../lib/env';
+import { clean, createMove, movesOf, isUpcoming, type Move } from '../lib/data';
+import { dateLabel, isZone } from '../lib/time';
+
+/**
+ * Home: the Moves you run and the ones you are helping on, and starting a new one. Any
+ * Person may start a Move and is its first Organizer (CONTEXT.md).
+ */
+const env = getEnv();
+const viewer = Astro.locals.viewer!; // the guard sends anyone else to sign-in
+let error: string | undefined;
+
+if (Astro.request.method === 'POST') {
+  const form = await Astro.request.formData();
+  const title = clean(form.get('title'), 80);
+  const tzIn = clean(form.get('tz'), 60);
+  const tz = isZone(tzIn) ? tzIn : 'America/New_York';
+  if (!title) error = 'Give the Move a name, like "Mom\'s move".';
+  else {
+    const id = await createMove(env.DB, { title, tz, by: viewer.id });
+    return Astro.redirect(u(`/m/${id}?new=1`), 303);
+  }
+}
+
+const { organizing, helping } = await movesOf(env.DB, viewer.id);
+const when = (m: Move) => (isUpcoming(m) ? 'Coming up' : `Forgotten ${dateLabel(m.forgetAt, m.tz)}`);
+---
+
+<Base title="MoveLink">
+  <h1 class="page">MoveLink</h1>
+  <p class="page-lead">Round up friends, a truck and some boxes for moving day. Share one link; whoever opens it can sign up for a shift without an account.</p>
+
+  {organizing.length > 0 && (
+    <section>
+      <h2 class="section">Moves you're running</h2>
+      <div class="lt-card">
+        {organizing.map((m) => (
+          <a class="lt-item move-row" href={u(`/m/${m.id}`)}>
+            <span class="lt-item-main"><span class="move-name">{m.title}</span><span class="lt-muted small">{when(m)}</span></span>
+          </a>
+        ))}
+      </div>
+    </section>
+  )}
+
+  {helping.length > 0 && (
+    <section>
+      <h2 class="section">Moves you're helping with</h2>
+      <div class="lt-card">
+        {helping.map((m) => (
+          <a class="lt-item move-row" href={u(`/l/${m.link}`)}>
+            <span class="lt-item-main"><span class="move-name">{m.title}</span><span class="lt-muted small">{when(m)}</span></span>
+          </a>
+        ))}
+      </div>
+    </section>
+  )}
+
+  <section>
+    <h2 class="section">Start a move</h2>
+    <form method="post" class="lt-card lt-form">
+      {error && <div class="lt-callout lt-tone-error">{error}</div>}
+      <label class="lt-label">
+        <span>What's it called?</span>
+        <input class="lt-field" name="title" maxlength="80" placeholder="Mom's move" required />
+      </label>
+      <input type="hidden" name="tz" id="tz" value="America/New_York" />
+      <p class="lt-muted small" style="margin:0">Next you'll add the places, the shifts, and what you need. Thirty days after the last shift, MoveLink forgets the whole thing.</p>
+      <div class="lt-actions"><button class="lt-btn lt-btn-primary" type="submit">Start it</button></div>
+    </form>
+  </section>
+
+  <script is:inline>
+    try { document.getElementById('tz').value = Intl.DateTimeFormat().resolvedOptions().timeZone || 'America/New_York'; } catch (e) {}
+  </script>
+</Base>

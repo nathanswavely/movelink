@@ -1,0 +1,18 @@
+---
+import '../styles/global.css';
+import Shell from '@swavely-lol/kit/Shell.astro';
+import { getEnv, u } from '../lib/env';
+
+/**
+ * The shell every page on swavely.lol shares (the kit's, swavely-lol ADR-0004): the way
+ * home with "/ move" beside it, and the cog menu with the theme and sign in or out.
+ * A Helper on a Move link may not be signed in; the menu offers sign-in then.
+ */
+interface Props { title: string }
+const { title } = Astro.props;
+const env = getEnv();
+---
+
+<Shell title={title} hub={env.HUB_ORIGIN ?? ''} tool={{ label: 'move', href: u('/') }}>
+  <slot />
+</Shell>

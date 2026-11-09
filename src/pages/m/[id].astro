@@ -1,0 +1,383 @@
+---
+import Base from '../../layouts/Base.astro';
+import { getEnv, u } from '../../lib/env';
+import {
+  addNeed, addOrganizer, addPitchIn, clean, deleteMove, deleteNeed, deletePitchIn, deletePlace, deleteShift, getMove, isOrganizer,
+  isUpcoming, loadMove, removeHelper, removeOrganizer, replaceLink, savePlace, saveShift, shiftProblem, updateMove, type ShiftInput,
+} from '../../lib/data';
+import { tellHelperRemoved, tellShiftMoved } from '../../lib/notices';
+import { dateLabel, spanLabel } from '../../lib/time';
+
+/**
+ * An Organizer's page for one Move: share its link, set up its Places, Shifts, Needs and
+ * Pitch-ins, see who signed up (phones included, which only Organizers see), and run it
+ * with the other Organizers, who are all equal. Anyone else gets a 404.
+ */
+const env = getEnv();
+const viewer = Astro.locals.viewer!;
+const id = Astro.params.id ?? '';
+const found = await getMove(env.DB, id);
+if (!found || !(await isOrganizer(env.DB, id, viewer.id))) return new Response('Not found.', { status: 404 });
+let move = found;
+let error: string | undefined;
+
+const DONE: Record<string, string> = {
+  saved: 'Saved.',
+  link: 'New link made. The old one now only says it was replaced; send this one to whoever should have it.',
+  organizer: 'Organizer added. Let them know: they sign in at swavely.lol with that address.',
+  removed: 'Taken off the move.',
+  'last-organizer': 'A move needs at least one Organizer.',
+  'place-in-use': 'A shift is still at that place; move or delete the shift first.',
+};
+
+if (Astro.request.method === 'POST') {
+  const form = await Astro.request.formData();
+  const action = String(form.get('action') ?? '');
+  const f = (k: string, max = 200) => clean(form.get(k), max);
+  let done = 'saved';
+  const full = await loadMove(env.DB, move);
+
+  if (action === 'details') {
+    const title = f('title', 80);
+    if (!title) error = 'A move needs a name.';
+    else await updateMove(env.DB, id, { title, notes: f('notes', 1000) || null });
+  } else if (action === 'link') {
+    await replaceLink(env.DB, move);
+    done = 'link';
+  } else if (action === 'place') {
+    const label = f('label', 40);
+    const address = f('address', 200);
+    if (!label || !address) error = 'A place needs a label and an address.';
+    else await savePlace(env.DB, id, { id: f('id') || undefined, label, address, note: f('note', 500) || null });
+  } else if (action === 'delete-place') {
+    if (!(await deletePlace(env.DB, id, f('id')))) done = 'place-in-use';
+  } else if (action === 'shift') {
+    const day = f('day', 10);
+    const input: ShiftInput = {
+      id: f('id') || undefined,
+      placeId: f('place'),
+      job: f('job', 80),
+      starts: `${day}T${f('start', 5)}`,
+      ends: `${day}T${f('end', 5)}`,
+      wanted: Number(f('wanted', 3)),
+    };
+    error = shiftProblem(input, move.tz) ?? undefined;
+    if (!error) {
+      const { moved } = await saveShift(env.DB, move, input);
+      if (moved && input.id) {
+        const after = await loadMove(env.DB, move);
+        const shift = after.shifts.find((s) => s.id === input.id);
+        if (shift && shift.startsAt > Date.now() / 1000) await tellShiftMoved(env, after, shift);
+      }
+    }
+  } else if (action === 'delete-shift') {
+    await deleteShift(env.DB, id, f('id'));
+  } else if (action === 'need') {
+    const label = f('label', 80);
+    if (!label) error = 'Say what you need.';
+    else await addNeed(env.DB, id, label, f('note', 200) || null);
+  } else if (action === 'delete-need') {
+    await deleteNeed(env.DB, id, f('id'));
+  } else if (action === 'pitch-in') {
+    const label = f('label', 60);
+    const goal = Number(f('goal', 5));
+    if (!label) error = 'Say what everyone can pitch in.';
+    else await addPitchIn(env.DB, id, label, Number.isInteger(goal) && goal > 0 ? goal : null);
+  } else if (action === 'delete-pitch-in') {
+    await deletePitchIn(env.DB, id, f('id'));
+  } else if (action === 'remove-helper') {
+    const h = full.helpers.find((x) => x.id === f('id'));
+    if (h) {
+      await removeHelper(env.DB, id, h.id);
+      if (isUpcoming(move)) await tellHelperRemoved(env, full, h);
+      done = 'removed';
+    }
+  } else if (action === 'add-organizer') {
+    const name = f('name', 80);
+    const email = f('email', 200).toLowerCase();
+    if (!name || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) error = 'An Organizer needs a name and an email address to sign in with.';
+    else {
+      const { person } = await env.HUB.addPerson({ name, email, addedBy: viewer.id });
+      await addOrganizer(env.DB, id, person.id);
+      done = 'organizer';
+    }
+  } else if (action === 'remove-organizer') {
+    const who = f('id');
+    if (!(await removeOrganizer(env.DB, id, who))) done = 'last-organizer';
+    else if (who === viewer.id) return Astro.redirect(u('/'), 303);
+  } else if (action === 'delete-move') {
+    await deleteMove(env.DB, id);
+    return Astro.redirect(u('/'), 303);
+  }
+
+  if (!error) return Astro.redirect(u(`/m/${id}?done=${done}`), 303);
+  move = (await getMove(env.DB, id)) ?? move;
+}
+
+const m = await loadMove(env.DB, move);
+const organizers = await env.HUB.people(m.organizerIds);
+const helperById = new Map(m.helpers.map((h) => [h.id, h]));
+const placeById = new Map(m.places.map((p) => [p.id, p]));
+// The address to send: swavely.lol's (Astro.site) wherever this runs, except `astro dev`,
+// where it is this server's own. Never the request's: wrangler rewrites it to http.
+const link = new URL(u(`/l/${m.link}`), import.meta.env.DEV ? Astro.url.origin : Astro.site).toString();
+const done = Astro.url.searchParams.get('done');
+const isNew = Astro.url.searchParams.has('new');
+const upcoming = isUpcoming(m);
+const shiftsOf = (helperId: string) => m.shifts.filter((s) => (m.signups.get(s.id) ?? []).includes(helperId));
+const sms = (phones: string[]) => `sms:${phones.map((p) => p.replace(/[^\d+]/g, '')).join(',')}`;
+const total = (pid: string) => [...(m.shares.get(pid)?.values() ?? [])].reduce((a, b) => a + b, 0);
+---
+
+<Base title={m.title}>
+  <p class="crumbs"><a href={u('/')}>Your moves</a></p>
+  <h1 class="page">{m.title}</h1>
+  <p class="page-lead">{upcoming ? 'You and anyone you add run this move.' : 'This move is over.'} MoveLink forgets it, and everyone on it, on {dateLabel(m.forgetAt, m.tz)}.</p>
+
+  {error && <div class="lt-callout lt-tone-error" style="margin-bottom:1rem">{error}</div>}
+  {done && DONE[done] && <div class={`lt-callout lt-tone-${done === 'last-organizer' || done === 'place-in-use' ? 'warning' : 'success'}`} style="margin-bottom:1rem">{DONE[done]}</div>}
+
+  <section class="lt-card share">
+    <h2 style="margin-top:0">The move link</h2>
+    <p class="small" style="margin-top:0">Drop this in the group text. Whoever opens it sees everything except phone numbers, and can sign up without an account.</p>
+    <div class="share-row">
+      <input class="lt-field" id="move-link" value={link} readonly aria-label="Move link" />
+      <button type="button" class="lt-btn lt-btn-primary" id="copy-link">Copy</button>
+    </div>
+    <form method="post" class="share-replace" onsubmit="return confirm('Make a new link? The old one stops working, but everyone who signed up keeps their answer.')">
+      <input type="hidden" name="action" value="link" />
+      <button class="lt-btn lt-btn-ghost lt-btn-sm" type="submit">Link got out? Make a new one</button>
+    </form>
+  </section>
+
+  {isNew && m.places.length === 0 && (
+    <div class="lt-callout lt-tone-info" style="margin-top:var(--lt-stack)">Start with where it's happening: add the old place and the new one. Then add shifts at each.</div>
+  )}
+
+  <h2 class="section">Places</h2>
+  <div class="lt-card">
+    {m.places.map((p) => (
+      <div class="lt-item">
+        <div class="lt-item-main">
+          <div><span class="item-name">{p.label}</span> <span class="lt-muted small">{p.address}</span></div>
+          {p.note && <div class="lt-muted small">{p.note}</div>}
+          <details class="edit">
+            <summary>Edit</summary>
+            <form method="post" class="lt-form">
+              <input type="hidden" name="action" value="place" /><input type="hidden" name="id" value={p.id} />
+              <div class="lt-field-row">
+                <label class="lt-label"><span>Label</span><input class="lt-field" name="label" value={p.label} maxlength="40" required /></label>
+                <label class="lt-label"><span>Address</span><input class="lt-field" name="address" value={p.address} maxlength="200" required /></label>
+              </div>
+              <label class="lt-label"><span>Note <span class="lt-optional">(parking, door code, stairs)</span></span><input class="lt-field" name="note" value={p.note ?? ''} maxlength="500" /></label>
+              <div class="lt-actions"><button class="lt-btn lt-btn-primary lt-btn-sm" type="submit">Save</button></div>
+            </form>
+            <form method="post" class="lt-actions"><input type="hidden" name="action" value="delete-place" /><input type="hidden" name="id" value={p.id} /><button class="lt-btn lt-btn-danger lt-btn-sm" type="submit">Delete place</button></form>
+          </details>
+        </div>
+      </div>
+    ))}
+    <details class="add" open={m.places.length === 0}>
+      <summary>Add a place</summary>
+      <form method="post" class="lt-form">
+        <input type="hidden" name="action" value="place" />
+        <div class="lt-field-row">
+          <label class="lt-label"><span>Label</span><input class="lt-field" name="label" placeholder={m.places.length ? 'new apartment' : 'old house'} maxlength="40" required /></label>
+          <label class="lt-label"><span>Address</span><input class="lt-field" name="address" maxlength="200" required /></label>
+        </div>
+        <label class="lt-label"><span>Note <span class="lt-optional">(parking, door code, stairs)</span></span><input class="lt-field" name="note" maxlength="500" /></label>
+        <div class="lt-actions"><button class="lt-btn lt-btn-primary lt-btn-sm" type="submit">Add place</button></div>
+      </form>
+    </details>
+  </div>
+
+  <h2 class="section">Shifts</h2>
+  <div class="lt-card">
+    {m.shifts.length === 0 && <p class="lt-muted small" style="margin:0 0 0.5rem">No shifts yet. A simple move has one.</p>}
+    {m.shifts.map((s) => {
+      const who = (m.signups.get(s.id) ?? []).map((hid) => helperById.get(hid)!).filter(Boolean);
+      const phones = who.map((h) => h.phone).filter((p): p is string => !!p);
+      const extra = who.length - s.wanted;
+      return (
+        <div class="lt-item">
+          <div class="lt-item-main">
+            <div class="row">
+              <span class="item-name">{s.job}</span>
+              <span class={`lt-tag ${who.length >= s.wanted ? 'lt-tone-success' : 'lt-tone-warning'}`}>{Math.min(who.length, s.wanted)} of {s.wanted}{who.length >= s.wanted ? ' ✓' : ''}</span>
+              {extra > 0 && <span class="lt-tag lt-tone-muted">+{extra} extra</span>}
+            </div>
+            <div class="lt-muted small">{spanLabel(s.starts, s.ends)} · {placeById.get(s.placeId)?.label}</div>
+            {who.length > 0 && (
+              <ul class="people">
+                {who.map((h) => <li>{h.name}{h.phone && <span class="lt-muted"> · <a href={`tel:${h.phone}`}>{h.phone}</a></span>}</li>)}
+              </ul>
+            )}
+            {phones.length > 1 && <a class="lt-btn lt-btn-sm" href={sms(phones)}>Text everyone on this shift</a>}
+            <details class="edit">
+              <summary>Edit</summary>
+              <form method="post" class="lt-form">
+                <input type="hidden" name="action" value="shift" /><input type="hidden" name="id" value={s.id} />
+                <label class="lt-label"><span>What for</span><input class="lt-field" name="job" value={s.job} maxlength="80" required /></label>
+                <div class="lt-field-row">
+                  <label class="lt-label"><span>Place</span><select class="lt-field" name="place">{m.places.map((p) => <option value={p.id} selected={p.id === s.placeId}>{p.label}</option>)}</select></label>
+                  <label class="lt-label"><span>People</span><input class="lt-field" type="number" name="wanted" min="1" max="99" value={s.wanted} required /></label>
+                </div>
+                <div class="lt-field-row">
+                  <label class="lt-label"><span>Day</span><input class="lt-field" type="date" name="day" value={s.starts.slice(0, 10)} required /></label>
+                  <label class="lt-label"><span>From</span><input class="lt-field" type="time" name="start" value={s.starts.slice(11)} required /></label>
+                  <label class="lt-label"><span>To</span><input class="lt-field" type="time" name="end" value={s.ends.slice(11)} required /></label>
+                </div>
+                <p class="lt-muted small" style="margin:0">Changing the time or place emails the helpers on it who have accounts.</p>
+                <div class="lt-actions"><button class="lt-btn lt-btn-primary lt-btn-sm" type="submit">Save</button></div>
+              </form>
+              <form method="post" class="lt-actions" onsubmit="return confirm('Delete this shift? Everyone signed up for it comes off it.')"><input type="hidden" name="action" value="delete-shift" /><input type="hidden" name="id" value={s.id} /><button class="lt-btn lt-btn-danger lt-btn-sm" type="submit">Delete shift</button></form>
+            </details>
+          </div>
+        </div>
+      );
+    })}
+    {m.places.length > 0 ? (
+      <details class="add" open={m.shifts.length === 0}>
+        <summary>Add a shift</summary>
+        <form method="post" class="lt-form">
+          <input type="hidden" name="action" value="shift" />
+          <label class="lt-label"><span>What for</span><input class="lt-field" name="job" placeholder="Load the truck" maxlength="80" required /></label>
+          <div class="lt-field-row">
+            <label class="lt-label"><span>Place</span><select class="lt-field" name="place">{m.places.map((p) => <option value={p.id}>{p.label}</option>)}</select></label>
+            <label class="lt-label"><span>People</span><input class="lt-field" type="number" name="wanted" min="1" max="99" value="4" required /></label>
+          </div>
+          <div class="lt-field-row">
+            <label class="lt-label"><span>Day</span><input class="lt-field" type="date" name="day" required /></label>
+            <label class="lt-label"><span>From</span><input class="lt-field" type="time" name="start" value="09:00" required /></label>
+            <label class="lt-label"><span>To</span><input class="lt-field" type="time" name="end" value="12:00" required /></label>
+          </div>
+          <p class="lt-muted small" style="margin:0">The number is a goal, not a cap: once it's met, more can still sign up.</p>
+          <div class="lt-actions"><button class="lt-btn lt-btn-primary lt-btn-sm" type="submit">Add shift</button></div>
+        </form>
+      </details>
+    ) : <p class="lt-muted small" style="margin:0">Add a place first; every shift happens at one.</p>}
+  </div>
+
+  <h2 class="section">Needs</h2>
+  <p class="lt-muted small section-lead">Things one person covers, like a truck or pizza. Two trucks? Add two.</p>
+  <div class="lt-card">
+    {m.needs.map((n) => (
+      <div class="lt-item">
+        <div class="lt-item-main">
+          <div class="row">
+            <span class="item-name">{n.label}</span>
+            {n.offered && <span class="lt-tag lt-tone-muted">offered</span>}
+            {n.takenBy ? <span class="lt-tag lt-tone-success">{helperById.get(n.takenBy)?.name ?? 'someone'}</span> : <span class="lt-tag lt-tone-warning">nobody yet</span>}
+          </div>
+          {n.note && <div class="lt-muted small">{n.note}</div>}
+        </div>
+        <form method="post"><input type="hidden" name="action" value="delete-need" /><input type="hidden" name="id" value={n.id} /><button class="lt-btn lt-btn-ghost lt-btn-sm" type="submit" aria-label={`Delete ${n.label}`}>Delete</button></form>
+      </div>
+    ))}
+    <details class="add" open={m.needs.length === 0}>
+      <summary>Add a need</summary>
+      <form method="post" class="lt-form">
+        <input type="hidden" name="action" value="need" />
+        <div class="lt-field-row">
+          <label class="lt-label"><span>What</span><input class="lt-field" name="label" placeholder="Pickup truck" maxlength="80" required /></label>
+          <label class="lt-label"><span>Note <span class="lt-optional">(optional)</span></span><input class="lt-field" name="note" maxlength="200" /></label>
+        </div>
+        <div class="lt-actions"><button class="lt-btn lt-btn-primary lt-btn-sm" type="submit">Add need</button></div>
+      </form>
+    </details>
+  </div>
+
+  <h2 class="section">Pitch-ins</h2>
+  <p class="lt-muted small section-lead">Things everyone can bring some of, like boxes or tape. Would two people bringing it be a problem? Then it's a need.</p>
+  <div class="lt-card">
+    {m.pitchIns.map((p) => {
+      const shares = [...(m.shares.get(p.id) ?? new Map<string, number>())];
+      return (
+        <div class="lt-item">
+          <div class="lt-item-main">
+            <div class="row"><span class="item-name">{p.label}</span><span class="lt-tag">about {total(p.id)}{p.goal ? ` of ${p.goal}` : ''}</span></div>
+            {shares.length > 0 && <div class="lt-muted small">{shares.map(([hid, n]) => `${helperById.get(hid)?.name ?? 'someone'} ${n}`).join(' · ')}</div>}
+          </div>
+          <form method="post"><input type="hidden" name="action" value="delete-pitch-in" /><input type="hidden" name="id" value={p.id} /><button class="lt-btn lt-btn-ghost lt-btn-sm" type="submit" aria-label={`Delete ${p.label}`}>Delete</button></form>
+        </div>
+      );
+    })}
+    <details class="add" open={m.pitchIns.length === 0}>
+      <summary>Add a pitch-in</summary>
+      <form method="post" class="lt-form">
+        <input type="hidden" name="action" value="pitch-in" />
+        <div class="lt-field-row">
+          <label class="lt-label"><span>What</span><input class="lt-field" name="label" placeholder="Boxes" maxlength="60" required /></label>
+          <label class="lt-label"><span>About how many <span class="lt-optional">(optional)</span></span><input class="lt-field" type="number" name="goal" min="1" max="9999" /></label>
+        </div>
+        <div class="lt-actions"><button class="lt-btn lt-btn-primary lt-btn-sm" type="submit">Add pitch-in</button></div>
+      </form>
+    </details>
+  </div>
+
+  <h2 class="section">Helpers</h2>
+  <div class="lt-card">
+    {m.helpers.length === 0 && <p class="lt-muted small" style="margin:0">Nobody yet. Send the link.</p>}
+    {m.helpers.map((h) => (
+      <div class="lt-item">
+        <div class="lt-item-main">
+          <div class="row"><span class="item-name">{h.name}</span>{h.personId && <span class="lt-tag lt-tone-muted">has an account</span>}</div>
+          <div class="lt-muted small">
+            {h.phone ? <a href={`tel:${h.phone}`}>{h.phone}</a> : 'No phone given'}
+            {' · '}{shiftsOf(h.id).map((s) => s.job).join(', ') || 'No shifts'}
+          </div>
+          {h.note && <div class="small">“{h.note}”</div>}
+        </div>
+        <form method="post" onsubmit="return confirm('Take this person off the move?')"><input type="hidden" name="action" value="remove-helper" /><input type="hidden" name="id" value={h.id} /><button class="lt-btn lt-btn-ghost lt-btn-sm" type="submit">Remove</button></form>
+      </div>
+    ))}
+  </div>
+
+  <h2 class="section">Organizers</h2>
+  <div class="lt-card">
+    {organizers.map((p) => (
+      <div class="lt-item">
+        <div class="lt-item-main"><span class="item-name">{p.name}{p.id === viewer.id ? ' (you)' : ''}</span></div>
+        {organizers.length > 1 && (
+          <form method="post" onsubmit={p.id === viewer.id ? "return confirm('Stop running this move?')" : undefined}><input type="hidden" name="action" value="remove-organizer" /><input type="hidden" name="id" value={p.id} /><button class="lt-btn lt-btn-ghost lt-btn-sm" type="submit">{p.id === viewer.id ? 'Leave' : 'Remove'}</button></form>
+        )}
+      </div>
+    ))}
+    <details class="add">
+      <summary>Add an organizer</summary>
+      <form method="post" class="lt-form">
+        <input type="hidden" name="action" value="add-organizer" />
+        <div class="lt-field-row">
+          <label class="lt-label"><span>Name</span><input class="lt-field" name="name" maxlength="80" required /></label>
+          <label class="lt-label"><span>Email</span><input class="lt-field" type="email" name="email" required /></label>
+        </div>
+        <p class="lt-muted small" style="margin:0">They can do everything you can. If they're already on swavely.lol, use the address they sign in with.</p>
+        <div class="lt-actions"><button class="lt-btn lt-btn-primary lt-btn-sm" type="submit">Add organizer</button></div>
+      </form>
+    </details>
+  </div>
+
+  <h2 class="section">About this move</h2>
+  <form method="post" class="lt-card lt-form">
+    <input type="hidden" name="action" value="details" />
+    <label class="lt-label"><span>Name</span><input class="lt-field" name="title" value={m.title} maxlength="80" required /></label>
+    <label class="lt-label"><span>Notes for helpers <span class="lt-optional">(optional)</span></span><textarea class="lt-field" name="notes" rows="3" maxlength="1000">{m.notes ?? ''}</textarea></label>
+    <div class="lt-actions"><button class="lt-btn lt-btn-primary lt-btn-sm" type="submit">Save</button></div>
+  </form>
+  <form method="post" class="lt-actions danger-zone" onsubmit="return confirm('Delete this move now, with everyone on it? This cannot be undone.')">
+    <input type="hidden" name="action" value="delete-move" />
+    <button class="lt-btn lt-btn-danger lt-btn-sm" type="submit">Delete this move now</button>
+  </form>
+
+  <script is:inline>
+    (function () {
+      var b = document.getElementById('copy-link'), f = document.getElementById('move-link');
+      if (!b || !f) return;
+      b.addEventListener('click', function () {
+        var done = function () { b.textContent = 'Copied'; setTimeout(function () { b.textContent = 'Copy'; }, 1600); };
+        if (navigator.clipboard) navigator.clipboard.writeText(f.value).then(done, function () { f.select(); });
+        else f.select();
+      });
+    })();
+  </script>
+</Base>

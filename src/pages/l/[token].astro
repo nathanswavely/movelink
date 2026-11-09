@@ -1,0 +1,262 @@
+---
+import Base from '../../layouts/Base.astro';
+import { readCookie } from '@swavely-lol/kit/guard';
+import { getEnv, hubUrl, u } from '../../lib/env';
+import {
+  clean, currentHelper, isUpcoming, loadMove, moveByLink, randomToken, removeHelper, saveAnswer, sha256Hex, withdrawOffer, type Answer,
+} from '../../lib/data';
+import { tellLateCancel } from '../../lib/notices';
+import { isLateCancel, spanLabel } from '../../lib/time';
+
+/**
+ * The Move link (CONTEXT.md): everything about the Move, to whoever holds the link, and
+ * signing up without signing in. A Person who is signed in signs up as themselves; anyone
+ * else gives a name (and a phone, which only the Organizers see) and their browser is
+ * remembered by the ml_helper cookie. While the Move is still to come, a Helper may also
+ * make themselves a Person (the Hub's Joined, swavely-lol ADR-0005).
+ */
+const env = getEnv();
+const viewer = Astro.locals.viewer;
+const token = Astro.params.token ?? '';
+const { move, replaced } = await moveByLink(env.DB, token);
+if (!move) Astro.response.status = replaced ? 410 : 404;
+
+const COOKIE = 'ml_helper';
+const cookieValue = readCookie(Astro.request, COOKIE);
+const browserOf = async (v: string | null) => (v && /^[A-Za-z0-9_-]{20,40}$/.test(v) ? await sha256Hex(v) : undefined);
+let browser = await browserOf(cookieValue);
+let error: string | undefined;
+const here = u(`/l/${token}`);
+
+if (move && Astro.request.method === 'POST') {
+  const form = await Astro.request.formData();
+  const action = String(form.get('action') ?? '');
+  const full = await loadMove(env.DB, move);
+  const who = { personId: viewer?.id, browser };
+  const me = await currentHelper(env.DB, move.id, who);
+  const t = Math.floor(Date.now() / 1000);
+  const lateOf = (shiftIds: string[]) => full.shifts.filter((s) => shiftIds.includes(s.id) && isLateCancel(s.startsAt, t));
+
+  if (action === 'answer' && isUpcoming(move)) {
+    const name = viewer ? viewer.name : clean(form.get('name'), 60);
+    const shares = new Map<string, number>();
+    for (const p of full.pitchIns) {
+      const n = Number(clean(form.get(`share:${p.id}`), 4));
+      if (Number.isInteger(n) && n > 0 && n < 10000) shares.set(p.id, n);
+    }
+    const answer: Answer = {
+      name,
+      phone: clean(form.get('phone'), 30) || null,
+      note: clean(form.get('note'), 300) || null,
+      shiftIds: form.getAll('shift').map(String),
+      needIds: form.getAll('need').map(String),
+      shares,
+      offer: clean(form.get('offer'), 80) || null,
+    };
+    const keepsOffers = full.needs.some((n) => n.offered && me && n.takenBy === me.id);
+    if (!name) error = 'Put your name in, so they know who is coming.';
+    else if (!answer.shiftIds.length && !answer.needIds.length && !shares.size && !answer.offer && !keepsOffers) error = 'Pick a shift, or something to bring.';
+    else {
+      if (!viewer && !browser) {
+        const fresh = randomToken(24);
+        Astro.cookies.set(COOKIE, fresh, { path: u('/'), maxAge: 90 * 86_400, httpOnly: true, sameSite: 'lax', secure: Astro.url.protocol === 'https:' });
+        browser = await browserOf(fresh);
+      }
+      const { dropped } = await saveAnswer(env.DB, full, me, { personId: viewer?.id, browser }, answer);
+      await tellLateCancel(env, full, name, lateOf(dropped));
+      return Astro.redirect(`${here}?done=${me ? 'saved' : 'signed'}`, 303);
+    }
+  } else if (action === 'cancel' && me) {
+    const mine = full.shifts.filter((s) => (full.signups.get(s.id) ?? []).includes(me.id)).map((s) => s.id);
+    await removeHelper(env.DB, move.id, me.id);
+    await tellLateCancel(env, full, me.name, lateOf(mine));
+    return Astro.redirect(`${here}?done=cancelled`, 303);
+  } else if (action === 'withdraw-offer' && me) {
+    await withdrawOffer(env.DB, move.id, me.id, String(form.get('id') ?? ''));
+    return Astro.redirect(`${here}?done=saved`, 303);
+  } else if (action === 'join' && me && !viewer && isUpcoming(move)) {
+    const email = clean(form.get('email'), 200).toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) error = 'That email address does not look right.';
+    else {
+      // Credited to the Move's first Organizer, whose link it is. Their answer moves to the
+      // account only once they have signed in with the code, from this browser.
+      await env.HUB.addPerson({ name: me.name, email, addedBy: full.organizerIds[0] ?? move.createdBy, via: `${move.title} on MoveLink` });
+      const q = new URLSearchParams({ next: here, email });
+      return Astro.redirect(hubUrl(env, `/login?${q}`), 303);
+    }
+  }
+}
+
+const m = move ? await loadMove(env.DB, move) : null;
+const me = m ? await currentHelper(env.DB, m.id, { personId: viewer?.id, browser }) : null;
+const organizers = m ? await env.HUB.people(m.organizerIds) : [];
+const helperName = (id: string | null) => (id ? m?.helpers.find((h) => h.id === id)?.name ?? 'someone' : null);
+const placeOf = (id: string) => m?.places.find((p) => p.id === id);
+const mineShifts = new Set(m && me ? m.shifts.filter((s) => (m.signups.get(s.id) ?? []).includes(me.id)).map((s) => s.id) : []);
+const upcoming = m ? isUpcoming(m) : false;
+const done = Astro.url.searchParams.get('done');
+const isOrganizer = !!(viewer && m?.organizerIds.includes(viewer.id));
+const list = (names: string[]) => (names.length <= 2 ? names.join(' and ') : `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`);
+---
+
+{!m ? (
+  <Base title={replaced ? 'Link replaced' : 'Not found'}>
+    <div class="lt-card gone">
+      <h1 class="page">{replaced ? 'This link was replaced' : "This link doesn't go anywhere"}</h1>
+      <p>{replaced ? "Whoever's running this move made a new one. Ask whoever sent it to you for the new link." : "The move may be over and forgotten, or the link is missing a bit. Ask whoever sent it."}</p>
+    </div>
+  </Base>
+) : (
+  <Base title={m.title}>
+    <h1 class="page">{m.title}</h1>
+    <p class="page-lead">
+      {organizers.length > 0 && <>Run by {list(organizers.map((p) => p.name))}. </>}
+      {upcoming ? 'Pick a shift or something to bring. No account needed.' : 'This move is over. Thanks to everyone who helped.'}
+      {isOrganizer && <> <a href={u(`/m/${m.id}`)}>Manage this move</a></>}
+    </p>
+
+    {done === 'signed' && <div class="lt-callout lt-tone-success">You're signed up. This browser remembers you, so you can come back here to change your answer.</div>}
+    {done === 'saved' && <div class="lt-callout lt-tone-success">Saved.</div>}
+    {done === 'cancelled' && <div class="lt-callout lt-tone-info">You're off this move.</div>}
+    {error && <div class="lt-callout lt-tone-error">{error}</div>}
+    {m.notes && <div class="lt-card notes"><p style="margin:0;white-space:pre-line">{m.notes}</p></div>}
+
+    <h2 class="section">Where</h2>
+    <div class="places">
+      {m.places.map((p) => (
+        <div class="lt-card place">
+          <div class="item-name">{p.label}</div>
+          <div><a href={`https://maps.google.com/?q=${encodeURIComponent(p.address)}`} rel="noopener">{p.address}</a></div>
+          {p.note && <div class="lt-muted small">{p.note}</div>}
+        </div>
+      ))}
+    </div>
+
+    <form method="post" class="answer">
+      <input type="hidden" name="action" value="answer" />
+
+      <h2 class="section">Shifts</h2>
+      <div class="lt-card">
+        {m.shifts.length === 0 && <p class="lt-muted small" style="margin:0">No shifts yet.</p>}
+        {m.shifts.map((s) => {
+          const who = (m.signups.get(s.id) ?? []).map((id) => helperName(id)!);
+          const past = s.endsAt <= Date.now() / 1000;
+          return (
+            <label class="lt-item pick">
+              {upcoming && !past && <input type="checkbox" name="shift" value={s.id} checked={mineShifts.has(s.id)} />}
+              <span class="lt-item-main">
+                <span class="row">
+                  <span class="item-name">{s.job}</span>
+                  <span class={`lt-tag ${who.length >= s.wanted ? 'lt-tone-success' : 'lt-tone-warning'}`}>{who.length >= s.wanted ? `${s.wanted} of ${s.wanted} ✓` : `${s.wanted - who.length} more needed`}</span>
+                  {who.length > s.wanted && <span class="lt-tag lt-tone-muted">+{who.length - s.wanted} extra</span>}
+                </span>
+                <span class="lt-muted small">{spanLabel(s.starts, s.ends)} · {placeOf(s.placeId)?.label}</span>
+                {who.length > 0 && <span class="small">{list(who)}</span>}
+              </span>
+            </label>
+          );
+        })}
+      </div>
+
+      {m.needs.length > 0 && (
+        <>
+          <h2 class="section">Needs</h2>
+          <p class="lt-muted small section-lead">One person covers each of these.</p>
+          <div class="lt-card">
+            {m.needs.map((n) => {
+              const mine = !!me && n.takenBy === me.id;
+              const free = !n.takenBy;
+              return (
+                <label class="lt-item pick">
+                  {upcoming && !n.offered && (free || mine) && <input type="checkbox" name="need" value={n.id} checked={mine} />}
+                  <span class="lt-item-main">
+                    <span class="row">
+                      <span class="item-name">{n.label}</span>
+                      {n.takenBy ? <span class="lt-tag lt-tone-success">{mine ? 'you' : helperName(n.takenBy)}</span> : <span class="lt-tag lt-tone-warning">nobody yet</span>}
+                    </span>
+                    {n.note && <span class="lt-muted small">{n.note}</span>}
+                  </span>
+                </label>
+              );
+            })}
+          </div>
+        </>
+      )}
+
+      {m.pitchIns.length > 0 && (
+        <>
+          <h2 class="section">Pitch-ins</h2>
+          <p class="lt-muted small section-lead">Bring some if you can; every bit adds up.</p>
+          <div class="lt-card">
+            {m.pitchIns.map((p) => {
+              const shares = [...(m.shares.get(p.id) ?? new Map<string, number>())];
+              const total = shares.reduce((a, [, n]) => a + n, 0);
+              const mine = me ? m.shares.get(p.id)?.get(me.id) : undefined;
+              return (
+                <div class="lt-item">
+                  <div class="lt-item-main">
+                    <div class="row"><span class="item-name">{p.label}</span><span class="lt-tag">about {total}{p.goal ? ` of ${p.goal}` : ''}</span></div>
+                    {shares.length > 0 && <div class="lt-muted small">{shares.map(([hid, n]) => `${hid === me?.id ? 'you' : helperName(hid)} ${n}`).join(' · ')}</div>}
+                  </div>
+                  {upcoming && (
+                    <label class="share-in"><span class="lt-muted small">I'll bring about</span><input class="lt-field" type="number" name={`share:${p.id}`} min="0" max="9999" value={mine ?? ''} aria-label={`How many ${p.label.toLowerCase()} you'll bring`} /></label>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </>
+      )}
+
+      {upcoming && (
+        <>
+          <h2 class="section">{me ? 'Your answer' : 'Sign up'}</h2>
+          <div class="lt-card lt-form">
+            {viewer ? (
+              <p class="small" style="margin:0">Signing up as <strong>{viewer.name}</strong>.</p>
+            ) : (
+              <label class="lt-label"><span>Your name</span><input class="lt-field" name="name" value={me?.name ?? ''} maxlength="60" autocomplete="name" required /></label>
+            )}
+            <label class="lt-label"><span>Phone <span class="lt-optional">(optional; only whoever's running the move sees it)</span></span><input class="lt-field" type="tel" name="phone" value={me?.phone ?? ''} maxlength="30" autocomplete="tel" /></label>
+            <label class="lt-label"><span>Can you bring something that isn't listed? <span class="lt-optional">(optional)</span></span><input class="lt-field" name="offer" maxlength="80" placeholder="I have a dolly" /></label>
+            <label class="lt-label"><span>A note for them <span class="lt-optional">(optional)</span></span><input class="lt-field" name="note" value={me?.note ?? ''} maxlength="300" placeholder="Can only stay till 11" /></label>
+            <div class="lt-actions">
+              <button class="lt-btn lt-btn-primary" type="submit">{me ? 'Save my answer' : 'Sign me up'}</button>
+            </div>
+          </div>
+        </>
+      )}
+    </form>
+
+    {me && upcoming && m.needs.filter((n) => n.offered && n.takenBy === me.id).map((n) => (
+      <form method="post" class="row small offer">
+        <input type="hidden" name="action" value="withdraw-offer" /><input type="hidden" name="id" value={n.id} />
+        <span>You offered <strong>{n.label}</strong>.</span>
+        <button class="lt-btn lt-btn-ghost lt-btn-sm" type="submit">Take it back</button>
+      </form>
+    ))}
+
+    {me && upcoming && (
+      <form method="post" class="lt-actions" onsubmit="return confirm('Take yourself off this move?')">
+        <input type="hidden" name="action" value="cancel" />
+        <button class="lt-btn lt-btn-ghost lt-btn-sm" type="submit">I can't make it after all</button>
+      </form>
+    )}
+
+    {me && !viewer && upcoming && (
+      <section class="lt-card join">
+        <h2 style="margin-top:0">Want an account?</h2>
+        <p class="small">Then you can change your answer from any phone and get a reminder the evening before. We'll email you a code; no password.</p>
+        <form method="post" class="lt-form">
+          <input type="hidden" name="action" value="join" />
+          <label class="lt-label"><span>Email</span><input class="lt-field" type="email" name="email" autocomplete="email" required /></label>
+          <div class="lt-actions"><button class="lt-btn" type="submit">Email me a code</button></div>
+        </form>
+      </section>
+    )}
+
+    {!me && !viewer && upcoming && (
+      <p class="lt-muted small" style="margin-top:var(--lt-stack)">Already on swavely.lol? <a href={hubUrl(env, `/login?next=${encodeURIComponent(here)}`)}>Sign in</a> and sign up as yourself.</p>
+    )}
+  </Base>
+)}

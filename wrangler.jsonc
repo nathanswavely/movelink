@@ -1,0 +1,48 @@
+// MoveLink at swavely.lol/move (swavely-lol ADR-0001).
+//
+// An Astro server build on a Cloudflare Worker. Its route is more specific than the
+// Hub's swavely.lol/*, so Cloudflare sends /move and everything under it here. Who is
+// signed in comes from the Hub over the HUB service binding (its HubApi entrypoint);
+// the Hub also sends every email. Deploy the Hub first: this binding names it.
+//
+// No secrets of its own.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "movelink",
+  // The main Cloudflare account, which holds the swavely.lol zone.
+  "account_id": "98521ca2e365abe021315e836c0a31ed",
+  // The adapter's own entrypoint plus a scheduled handler (src/worker.ts).
+  "main": "./src/worker.ts",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["nodejs_compat"],
+
+  "workers_dev": false,
+  "preview_urls": false,
+
+  "routes": [
+    { "pattern": "swavely.lol/move*", "zone_name": "swavely.lol" }
+  ],
+
+  "observability": { "enabled": true },
+
+  // Hourly: remove whoever the Hub has removed, forget Moves 30 days after their last
+  // Shift (ADR-0001), and send the evening-before emails. Locally,
+  // GET /cdn-cgi/handler/scheduled runs it once.
+  "triggers": { "crons": ["23 * * * *"] },
+
+  "services": [
+    { "binding": "HUB", "service": "swavely-lol", "entrypoint": "HubApi" }
+  ],
+
+  // Moves, Places, Shifts, Needs, Pitch-ins and Helpers (migrations/). Not created in
+  // Cloudflare yet: `wrangler d1 create movelink`, then put its id here. Locally the Vite
+  // plugin provides one under .wrangler/state whatever the id says.
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "movelink",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ]
+}
