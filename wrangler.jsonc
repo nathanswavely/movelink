@@ -34,14 +34,13 @@
     { "binding": "HUB", "service": "swavely-lol", "entrypoint": "HubApi" }
   ],
 
-  // Moves, Places, Shifts, Needs, Pitch-ins and Helpers (migrations/). Not created in
-  // Cloudflare yet: `wrangler d1 create movelink`, then put its id here. Locally the Vite
-  // plugin provides one under .wrangler/state whatever the id says.
+  // Moves, Places, Shifts, Needs, Pitch-ins and Helpers (migrations/). Created 2026-11-09
+  // in the main account; locally the Vite plugin provides one under .wrangler/state.
   "d1_databases": [
     {
       "binding": "DB",
       "database_name": "movelink",
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      "database_id": "d3dd483d-e3a8-4810-97c7-8d01f1966ec7",
       "migrations_dir": "migrations"
     }
   ]
